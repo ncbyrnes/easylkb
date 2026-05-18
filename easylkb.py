@@ -204,9 +204,12 @@ class Kbuilder:
         matches = glob.glob(f"/lib/modules/{version}*/build")
         return matches[-1] if matches else None
 
-    def KModBuild(self, kdir: str, rcwd: str | None = None) -> int:
-        cmdret = self.run(["make", "all", f"KDIR={kdir}"], rcwd=rcwd or self.BaseDir)
-        return cmdret
+    def KModBuild(
+        self, kdir: str, target: str = "all", rcwd: str | None = None, **make_vars
+    ) -> int:
+        cmd = ["make", target, f"KDIR={kdir}"]
+        cmd += [f"{key}={val}" for key, val in make_vars.items()]
+        return self.run(cmd, rcwd=rcwd or self.BaseDir)
 
     def DebImageBuild(self):
         self.logb(
