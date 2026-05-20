@@ -116,12 +116,28 @@ class Kbuilder:
                 print(e)
                 return retcode
 
+    def _parse_version(self) -> tuple[int, int, int]:
+        if not self.KVersion:
+            return (0, 0, 0)
+        parts = self.KVersion.split(".")
+        try:
+            major = int(parts[0]) if len(parts) > 0 else 0
+            minor = int(parts[1]) if len(parts) > 1 else 0
+            patch = int(parts[2]) if len(parts) > 2 else 0
+        except ValueError:
+            return (0, 0, 0)
+        return (major, minor, patch)
+
+    def _version_gte(self, major: int, minor: int = 0, patch: int = 0) -> bool:
+        return self._parse_version() >= (major, minor, patch)
+
     def KDownload(self):
         if self.KVersion:  # This means we're downloading a mainline kernel
-            version_checker = (
-                r"^([3-6])\.\d+(?:\.\d+)?$"  # support major versions 3,4,5,6
-            )
+            version_checker = r"^(\d+)\.\d+(?:\.\d+)?$"
             version = re.match(version_checker, self.KVersion)
+            if version and int(version.group(1)) < 3:
+                self.logb("fail", "Invalid or unsupported kernel version!")
+                return
             if not version:
                 self.logb("fail", "Invalid or unsupported kernel version!")
                 return
@@ -181,18 +197,30 @@ class Kbuilder:
         else:
             self.logb("warn", f"You must set self.KVersion before using KDownload().")
 
+    def _version_specific_configs(self, base_config: str) -> str:
+        if self._version_gte(6, 8):
+            base_config = base_config.replace(
+                "CONFIG_SLAB_DEBUG=y", "CONFIG_SLUB_DEBUG=y"
+            )
+        if self._version_gte(5, 18):
+            base_config = base_config.replace(
+                "CONFIG_DEBUG_INFO=y",
+                "CONFIG_DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT=y",
+            )
+        return base_config
+
     def KConfigure(self):
         cmdret = self.run(["make", "defconfig"], rcwd=self.KPath)
         cmdret = self.run(["make", "kvm_guest.config"], rcwd=self.KPath)
 
         self.logb("log", f"Appending {self.KConfig} to {self.KPath}.config")
-        KConfigFile = open(self.KConfig, "r")
-        ConfigFile = open(
-            f"{self.KPath}.config", "a+"
-        )  # This is the config file to write
-        ConfigFile.write(KConfigFile.read())
-        ConfigFile.close()
-        KConfigFile.close()
+        with open(self.KConfig, "r") as KConfigFile:
+            config_content = KConfigFile.read()
+
+        config_content = self._version_specific_configs(config_content)
+
+        with open(f"{self.KPath}.config", "a+") as ConfigFile:
+            ConfigFile.write(config_content)
 
         cmdret = self.run(["make", "olddefconfig"], rcwd=self.KPath)
 
