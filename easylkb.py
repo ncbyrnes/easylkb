@@ -7,12 +7,22 @@ import re
 import os
 import sys
 
+class KUsageError(ValueError):
+    pass
+
+
+class KRefNotFoundError(ValueError):
+    def __init__(self, version: str, available: list):
+        self.available = available
+        super().__init__(f"no ref exactly matching {version!r}")
+
 
 class Kbuilder:
-    def __init__(self, KConfig=None, KPath=None, KVersion="", KHostname="localhost"):
+    def __init__(self, KConfig=None, KPath=None, KVersion="", KHostname="localhost", kernels_dir=None):
         self.BaseDir = os.getcwd() + "/"
         self.LogDir = self.BaseDir + "log/"
         self.KVersion = KVersion  # The kernel version
+        self.kernels_dir = kernels_dir if kernels_dir is not None else f"{self.BaseDir}kernel/"
         if KConfig is not None:
             self.KConfig = KConfig
         else:
@@ -20,9 +30,7 @@ class Kbuilder:
         if KPath is not None:
             self.KPath = KPath
         else:
-            self.KPath = (
-                f"{self.BaseDir}kernel/linux-{KVersion}/"  # Path to this kernel
-            )
+            self.KPath = f"{self.kernels_dir}linux-{KVersion}/"
         self.ImgPath = self.KPath + "img/"
         self.KHostname = KHostname
         self.isDownloaded = False  # Is the tarball downloaded?
@@ -116,14 +124,14 @@ class Kbuilder:
                 print(e)
                 return retcode
 
-    def _parse_version(self) -> tuple[int, int, int]:
+    def _parse_version(self) -> tuple:
         if not self.KVersion:
             return (0, 0, 0)
         parts = self.KVersion.split(".")
         try:
-            major = int(parts[0]) if len(parts) > 0 else 0
+            major = int(parts[0])
             minor = int(parts[1]) if len(parts) > 1 else 0
-            patch = int(parts[2]) if len(parts) > 2 else 0
+            patch = int(parts[2].split("-")[0]) if len(parts) > 2 else 0
         except ValueError:
             return (0, 0, 0)
         return (major, minor, patch)
@@ -145,8 +153,7 @@ class Kbuilder:
             full_ver = version.group(0)
             tarball_url = f"https://cdn.kernel.org/pub/linux/kernel/v{major_ver}.x/linux-{full_ver}.tar.xz"
             file_name = f"linux-{full_ver}"
-            cwd = os.getcwd()
-            download_path = f"{cwd}/kernel/"  # TODO: Grab this from the class instead!!
+            download_path = self.kernels_dir
             archive_name = f"{file_name}.tar.xz"
             extracted_path = (
                 download_path + file_name
@@ -196,6 +203,34 @@ class Kbuilder:
                     )
         else:
             self.logb("warn", f"You must set self.KVersion before using KDownload().")
+
+    def KListRefs(self, git_url: str) -> list:
+        result = subprocess.run(
+            ["git", "ls-remote", "--tags", "--heads", git_url],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            raise ValueError(f"git ls-remote failed for {git_url!r}: {result.stderr.strip()}")
+        refs = []
+        for line in result.stdout.splitlines():
+            parts = line.split("\t", 1)
+            if len(parts) != 2:
+                continue
+            ref = parts[1].removeprefix("refs/tags/").removeprefix("refs/heads/")
+            if not ref.endswith("^{}"):
+                refs.append(ref)
+        return refs
+
+    def KDownloadGit(self, git_url: str) -> None:
+        refs = self.KListRefs(git_url)
+        if self.KVersion not in refs:
+            raise KRefNotFoundError(self.KVersion, [candidate for candidate in refs if self.KVersion in candidate])
+        dest = f"{self.kernels_dir}linux-{self.KVersion}/"
+        if os.path.isdir(dest):
+            self.logb("warn", f"Directory already exists: {dest}")
+            return
+        self.run(["git", "clone", "--depth=1", "--branch", self.KVersion, git_url, dest])
 
     def _version_specific_configs(self, base_config: str) -> str:
         if self._version_gte(6, 8):
@@ -268,6 +303,7 @@ class Kbuilder:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="easylkb - Easy Linux Kernel Builder")
+
     # Configuration
     parser.add_argument(
         "-k", dest="KVersion", help="Kernel Version - Downloads a mainline kernel"
@@ -277,6 +313,12 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--kconfig", dest="KConfig", help="KConfig, default is example.KConfig"
+    )
+    parser.add_argument(
+        "--git-url", dest="git_url", default=None, help="Git repo URL for distro kernel download"
+    )
+    parser.add_argument(
+        "--kernels-dir", dest="kernels_dir", default=None, help="Directory to store downloaded kernels"
     )
     # Actions
     parser.add_argument(
@@ -311,36 +353,45 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    if args.KVersion is None and args.KPath is None:
-        print("Please provide a kernel version with -k, or a kernel path with -p")
-        exit(1)
+    try:
+        if args.KVersion is None and args.KPath is None:
+            raise KUsageError("Please provide a kernel version with -k, or a kernel path with -p")
 
-    myKVersion = args.KVersion
-    myKPath = args.KPath
-    myKConfig = args.KConfig
-    Kb = Kbuilder(KVersion=myKVersion, KPath=myKPath, KConfig=myKConfig)
+        myKVersion = args.KVersion
+        myKPath = args.KPath
+        myKConfig = args.KConfig
+        Kb = Kbuilder(KVersion=myKVersion, KPath=myKPath, KConfig=myKConfig, kernels_dir=args.kernels_dir)
 
-    if args.DoAll:
-        if myKPath is not None:
-            args.KDownload = False  # Disable download if a path is specified
-        elif myKVersion is not None:
-            args.KDownload = True
-        else:
-            print("Please provide a kernel version with -k, or a kernel path with -p")
-            exit(1)
-        # Set all the options
-        args.KConfigure = True
-        args.KCompile = True
-        args.DebImageBuild = True
-        args.DebImageRun = True
+        if args.DoAll:
+            if myKPath is not None:
+                args.KDownload = False
+            elif myKVersion is not None:
+                args.KDownload = True
+            else:
+                raise KUsageError("Please provide a kernel version with -k, or a kernel path with -p")
+            args.KConfigure = True
+            args.KCompile = True
+            args.DebImageBuild = True
+            args.DebImageRun = True
 
-    if args.KDownload:
-        Kb.KDownload()  # Download specified kernel tarball
-    if args.KConfigure:
-        Kb.KConfigure()  # This applies kernel configurations we need to boot and debug the kernel.
-    if args.KCompile:
-        Kb.KCompile()  # Compile the kernel
-    if args.DebImageBuild:
-        Kb.DebImageBuild()  # This builds the debian image from the compiled kernel
-    if args.DebImageRun:
-        Kb.DebImageRun()
+        if args.KDownload:
+            if args.git_url:
+                Kb.KDownloadGit(args.git_url)
+            else:
+                Kb.KDownload()
+        if args.KConfigure:
+            Kb.KConfigure()
+        if args.KCompile:
+            Kb.KCompile()
+        if args.DebImageBuild:
+            Kb.DebImageBuild()
+        if args.DebImageRun:
+            Kb.DebImageRun()
+
+    except KRefNotFoundError as error:
+        print(error)
+        print("Available refs:")
+        for ref in error.available:
+            print(f"  {ref}")
+    except KUsageError as error:
+        print(error)
